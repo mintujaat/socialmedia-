@@ -1,20 +1,22 @@
-# BlueWave — HTML-first Social Platform
+# Qikly Social
 
-This build keeps the visible UI in real HTML/CSS. JavaScript is used for API calls, interactions, form submission, feed updates, image uploads, and chat behavior; it does not generate the entire site shell from an empty `<div>`.
+Next.js + Firebase Admin/Firestore + ImgBB. Firebase Storage is intentionally not used.
 
-## Deploy on Vercel
-- Put these files at the project root of the Vercel project: `index.html`, `style.css`, `app.js`, `admin.html`, `admin.js`, `api/index.js`, `package.json`, `vercel.json`.
-- Keep the Vercel Root Directory as the folder containing those files. Do not point it at a nested `public` folder.
-
-## Environment variables
-- `FIREBASE_SERVICE_ACCOUNT_JSON`
+## Vercel environment variables
+Copy `.env.example` to your Vercel project settings:
+- `NEXT_PUBLIC_FIREBASE_API_KEY` — Firebase Web API key (used for password sign-in REST call)
+- `FIREBASE_PROJECT_ID`
+- `FIREBASE_CLIENT_EMAIL`
+- `FIREBASE_PRIVATE_KEY` — keep `\n` escaped in Vercel value
 - `IMGBB_API_KEY`
-- `SESSION_SECRET`
-- `ADMIN_USERNAME`
-- `ADMIN_PASSWORD`
 
-## Firestore
-The backend uses Firebase Admin SDK and Firestore. Create the Firestore database in your Firebase project. No Firebase Storage is required for media uploads.
+Enable **Email/Password** in Firebase Authentication and create a Firestore database.
 
-## Media
-All profile/post/chat images are uploaded through `/api/media/upload` to ImgBB. Firestore stores the returned URL.
+## Admin
+After registering, set that user's Firestore document `role` to `admin`. Admin dashboard is `/admin`.
+
+## Run
+`npm install`
+`npm run dev`
+
+The app uses an HttpOnly Firebase session cookie and sends image files through the server to ImgBB; only the returned image URL is stored in Firestore.

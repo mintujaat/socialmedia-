@@ -1,1 +1,1 @@
-{"name":"bluewave-social","version":"3.0.0","private":true,"engines":{"node":">=20"},"dependencies":{"@vercel/node":"latest","express":"^5.1.0","firebase-admin":"^13.4.0"}}
+{"scripts":{"dev":"next dev","build":"next build","start":"next start","lint":"next lint"},"dependencies":{"@google-cloud/firestore":"^7.11.3","firebase-admin":"^13.5.0","firebase":"^12.1.0","next":"^15.5.2","react":"^19.1.1","react-dom":"^19.1.1"},"devDependencies":{"typescript":"^5.9.2","@types/node":"^24.3.0","@types/react":"^19.1.10","@types/react-dom":"^19.1.7"},"engines":{"node":">=20"}}

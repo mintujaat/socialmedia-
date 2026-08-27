@@ -1,0 +1,1 @@
+import{currentUser}from'@/lib/auth';import{db}from'@/lib/firebase-admin';import{ok}from'@/lib/response';export async function GET(){const u=await currentUser();if(!u)return ok({user:null});const s=await db.collection('users').doc(u.uid).get();return ok({user:{...s.data(),uid:u.uid}})}
