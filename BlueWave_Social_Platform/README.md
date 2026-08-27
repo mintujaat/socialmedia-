@@ -1,22 +1,32 @@
-# Qikly Social
+# BlueWave Social Platform
 
-Next.js + Firebase Admin/Firestore + ImgBB. Firebase Storage is intentionally not used.
+HTML/CSS/JS-first social platform for Vercel + Firebase Firestore + ImgBB.
 
-## Vercel environment variables
-Copy `.env.example` to your Vercel project settings:
-- `NEXT_PUBLIC_FIREBASE_API_KEY` — Firebase Web API key (used for password sign-in REST call)
-- `FIREBASE_PROJECT_ID`
-- `FIREBASE_CLIENT_EMAIL`
-- `FIREBASE_PRIVATE_KEY` — keep `\n` escaped in Vercel value
-- `IMGBB_API_KEY`
+## Features
+- Email + username + password registration/login
+- Home feed and Explore
+- Posts with text/photos
+- Likes, comments, bookmarks, shares
+- Follow / unfollow, followers / following
+- User search and suggestions
+- Profiles and profile editing
+- Private 1-to-1 chat and chat images
+- Notifications
+- Admin dashboard for users and post moderation
+- ImgBB for profile/cover/post/chat images; Firebase Storage is not required
 
-Enable **Email/Password** in Firebase Authentication and create a Firestore database.
+## Vercel
+Set Root Directory to the folder containing `index.html` and `api/`.
+No build command is required.
 
-## Admin
-After registering, set that user's Firestore document `role` to `admin`. Admin dashboard is `/admin`.
+### Environment variables
+- FIREBASE_SERVICE_ACCOUNT_JSON
+- IMGBB_API_KEY
+- SESSION_SECRET
+- ADMIN_USERNAME
+- ADMIN_PASSWORD
 
-## Run
-`npm install`
-`npm run dev`
+Optional legacy Firebase variables are supported by the API fallback, but the recommended setup is `FIREBASE_SERVICE_ACCOUNT_JSON`.
 
-The app uses an HttpOnly Firebase session cookie and sends image files through the server to ImgBB; only the returned image URL is stored in Firestore.
+## Firebase
+Enable Firestore. Deploy the included `firestore.rules` if Firestore is used only through the backend Admin SDK.

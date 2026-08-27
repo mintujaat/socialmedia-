@@ -1,62 +1,158 @@
-const express=require('express'),crypto=require('crypto'),admin=require('firebase-admin');
-const app=express();app.use(express.json({limit:'10mb'}));
-if(!admin.apps.length){const raw=process.env.FIREBASE_SERVICE_ACCOUNT_JSON;if(!raw)throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_JSON');admin.initializeApp({credential:admin.credential.cert(JSON.parse(raw)),databaseURL:process.env.FIREBASE_DATABASE_URL||undefined});}
-const db=admin.firestore(),FV=admin.firestore.FieldValue;
-const SECRET=process.env.SESSION_SECRET||'change-me';
-const clean=(v,m=1000)=>String(v??'').trim().slice(0,m), username=v=>clean(v,30).toLowerCase().replace(/[^a-z0-9_.-]/g,'');
-const uid=()=>crypto.randomBytes(12).toString('hex');
-function sign(v){return crypto.createHmac('sha256',SECRET).update(v).digest('hex')}
-function cookies(req){const out={};for(const part of (req.headers.cookie||'').split(';')){const i=part.indexOf('=');if(i>0)out[part.slice(0,i).trim()]=decodeURIComponent(part.slice(i+1).trim())}return out}
-function setSession(res,id){const exp=Date.now()+30*86400000,body=`${id}.${exp}`;res.setHeader('Set-Cookie',`bw_session=${encodeURIComponent(body+'.'+sign(body))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`)}
-function currentId(req){const p=(cookies(req).bw_session||'').split('.');if(p.length!==3||!p[0]||Number(p[1])<Date.now()||sign(`${p[0]}.${p[1]}`)!==p[2])return null;return p[0]}
-async function getUser(id){if(!id)return null;const s=await db.collection('users').doc(id).get();return s.exists?{id:s.id,...s.data()}:null}
-async function me(req){return getUser(currentId(req))}
-async function requireUser(req,res,next){try{const u=await me(req);if(!u)return res.status(401).json({error:'Login required.'});req.user=u;next()}catch(e){res.status(500).json({error:e.message})}}
-function safe(u){return{id:u.id,username:u.username,email:u.email||'',displayName:u.displayName||u.username,bio:u.bio||'',avatarUrl:u.avatarUrl||'',coverUrl:u.coverUrl||'',verified:!!u.verified,followersCount:u.followersCount||0,followingCount:u.followingCount||0,createdAt:u.createdAt||null}}
-function hashPassword(p,salt=crypto.randomBytes(16).toString('hex')){return new Promise((ok,no)=>crypto.scrypt(String(p),salt,64,(e,b)=>e?no(e):ok(`${salt}:${b.toString('hex')}`)))}
-function checkPassword(p,stored){return new Promise((ok,no)=>{const [salt,h]=String(stored||'').split(':');if(!salt||!h)return ok(false);crypto.scrypt(String(p),salt,64,(e,b)=>e?no(e):ok(crypto.timingSafeEqual(Buffer.from(h,'hex'),b)))})}
-async function imgBB(data){const key=process.env.IMGBB_API_KEY;if(!key)throw Error('IMGBB_API_KEY is not configured.');const raw=String(data).replace(/^data:image\/[^;]+;base64,/i,'').replace(/\s/g,'');const fd=new FormData();fd.append('key',key);fd.append('image',raw);const r=await fetch('https://api.imgbb.com/1/upload',{method:'POST',body:fd});const d=await r.json().catch(()=>({}));if(!r.ok||!d.success)throw Error(d.error?.message||'Image upload failed.');return d.data.url}
-function stamp(){return FV.serverTimestamp()}
-async function notify(userId,actorId,type,text,postId=''){if(!userId||userId===actorId)return;await db.collection('notifications').add({userId,actorId,type,text,postId,read:false,createdAt:stamp()})}
-async function attachUsers(posts,viewerId){const ids=[...new Set(posts.map(p=>p.authorId).filter(Boolean))];const users={};for(let i=0;i<ids.length;i+=10){const docs=await Promise.all(ids.slice(i,i+10).map(x=>db.collection('users').doc(x).get()));docs.forEach(s=>{if(s.exists)users[s.id]=safe({id:s.id,...s.data()})})}const liked=new Set(),saved=new Set();if(viewerId&&posts.length){const likes=await Promise.all(posts.map(p=>db.collection('postLikes').doc(`${p.id}_${viewerId}`).get()));likes.forEach((s,i)=>{if(s.exists)liked.add(posts[i].id)});const marks=await Promise.all(posts.map(p=>db.collection('bookmarks').doc(`${viewerId}_${p.id}`).get()));marks.forEach((s,i)=>{if(s.exists)saved.add(posts[i].id)})}return posts.map(p=>({...p,author:users[p.authorId]||null,liked:liked.has(p.id),bookmarked:saved.has(p.id)}))}
-app.get('/api/health',(req,res)=>res.json({ok:true,service:'BlueWave'}));
-app.get('/api/auth/me',async(req,res)=>{try{const u=await me(req);res.json({user:u?safe(u):null})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/auth/register',async(req,res)=>{try{const email=clean(req.body.email,160).toLowerCase(),un=username(req.body.username),pw=String(req.body.password||'');if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw Error('Please enter a valid email address.');if(!/^[a-z0-9_.-]{3,24}$/.test(un))throw Error('Username must be 3–24 characters.');if(pw.length<6)throw Error('Password must be at least 6 characters.');const ref=db.collection('users').doc(un),old=await ref.get();if(old.exists)throw Error('Username already exists.');const emailSnap=await db.collection('users').where('emailLower','==',email).limit(1).get();if(!emailSnap.empty)throw Error('Email is already registered.');const passwordHash=await hashPassword(pw);await ref.set({username:un,email,emailLower:email,displayName:clean(req.body.displayName,60)||un,bio:'',avatarUrl:'',coverUrl:'',passwordHash,followersCount:0,followingCount:0,verified:false,createdAt:stamp()});setSession(res,un);const u=await ref.get();res.json({ok:true,user:safe({id:ref.id,...u.data()})})}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/auth/login',async(req,res)=>{try{const email=clean(req.body.email,160).toLowerCase(),pw=String(req.body.password||'');if(!email||!pw)throw Error('Email and password are required.');const s=await db.collection('users').where('emailLower','==',email).limit(1).get();if(s.empty)throw Error('Invalid email or password.');const doc=s.docs[0],data=doc.data();if(!(await checkPassword(pw,data.passwordHash)))throw Error('Invalid email or password.');setSession(res,doc.id);res.json({ok:true,user:safe({id:doc.id,...data})})}catch(e){res.status(401).json({error:e.message})}});
-app.post('/api/admin/login',async(req,res)=>{try{const adminUser=clean(process.env.ADMIN_USERNAME,60).toLowerCase(),adminPass=String(process.env.ADMIN_PASSWORD||''),supplied=clean(req.body.username,60).toLowerCase(),pw=String(req.body.password||'');if(!adminUser||!adminPass||supplied!==adminUser||pw!==adminPass)throw Error('Invalid admin credentials.');setSession(res,adminUser);res.json({ok:true})}catch(e){res.status(401).json({error:e.message})}});
-app.post('/api/auth/logout',(req,res)=>{res.setHeader('Set-Cookie','bw_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');res.json({ok:true})});
-app.post('/api/media/upload',requireUser,async(req,res)=>{try{const data=String(req.body.data||'');if(!/^data:image\/(jpeg|jpg|png|webp|gif);base64,/i.test(data))throw Error('Only JPG, PNG, WEBP or GIF images are supported.');if(data.length>9*1024*1024)throw Error('Image is too large.');res.json({ok:true,url:await imgBB(data)})}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/profile/update',requireUser,(req,res)=>res.status(405).json({error:'Use POST.'}));
-app.post('/api/profile/update',requireUser,async(req,res)=>{try{const data={displayName:clean(req.body.displayName,60)||req.user.username,bio:clean(req.body.bio,280),avatarUrl:clean(req.body.avatarUrl,1000)};await db.collection('users').doc(req.user.id).update(data);const u=await getUser(req.user.id);res.json({ok:true,user:safe(u)})}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/feed',requireUser,async(req,res)=>{try{const fs=await db.collection('follows').where('followerId','==',req.user.id).get();const ids=[req.user.id,...fs.docs.map(d=>d.data().followingId)];let rows=[];for(let i=0;i<ids.length;i+=10){const s=await db.collection('posts').where('authorId','in',ids.slice(i,i+10)).limit(100).get();rows.push(...s.docs.map(d=>({id:d.id,...d.data()})))}rows.sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows.slice(0,80),req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/explore',requireUser,async(req,res)=>{try{const s=await db.collection('posts').limit(120).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows.slice(0,60),req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/posts',requireUser,async(req,res)=>{try{const text=clean(req.body.text,1000),imageUrl=clean(req.body.imageUrl,1000);if(!text&&!imageUrl)throw Error('Write something or add a photo.');const ref=db.collection('posts').doc();await ref.set({authorId:req.user.id,text,imageUrl,likesCount:0,commentsCount:0,createdAt:stamp()});res.json({ok:true,id:ref.id})}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/posts/:id/like',requireUser,async(req,res)=>{try{const post=await db.collection('posts').doc(req.params.id).get();if(!post.exists)throw Error('Post not found.');const ref=db.collection('postLikes').doc(`${req.params.id}_${req.user.id}`),s=await ref.get();let liked;if(s.exists){await ref.delete();await post.ref.update({likesCount:FV.increment(-1)});liked=false}else{await ref.set({postId:req.params.id,userId:req.user.id,createdAt:stamp()});await post.ref.update({likesCount:FV.increment(1)});liked=true;await notify(post.data().authorId,req.user.id,'like',`${req.user.displayName} liked your post`,req.params.id)}const fresh=await post.ref.get();res.json({ok:true,liked,likesCount:fresh.data().likesCount||0})}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/posts/:id/comments',requireUser,async(req,res)=>{try{const s=await db.collection('comments').where('postId','==',req.params.id).limit(100).get();const rows=s.docs.map(d=>({id:d.id,...d.data()}));rows.sort((a,b)=>(a.createdAt?._seconds||0)-(b.createdAt?._seconds||0));const out=[];for(const c of rows){const u=await getUser(c.userId);out.push({...c,author:u?safe(u):null})}res.json({comments:out})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/posts/:id/comments',requireUser,async(req,res)=>{try{const text=clean(req.body.text,500);if(!text)throw Error('Comment is empty.');const p=await db.collection('posts').doc(req.params.id).get();if(!p.exists)throw Error('Post not found.');await db.collection('comments').add({postId:req.params.id,userId:req.user.id,text,createdAt:stamp()});await p.ref.update({commentsCount:FV.increment(1)});await notify(p.data().authorId,req.user.id,'comment',`${req.user.displayName} replied to your post`,req.params.id);res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/posts/:id/bookmark',requireUser,async(req,res)=>{try{const ref=db.collection('bookmarks').doc(`${req.user.id}_${req.params.id}`),s=await ref.get();if(s.exists)await ref.delete();else await ref.set({userId:req.user.id,postId:req.params.id,createdAt:stamp()});res.json({ok:true,bookmarked:!s.exists})}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/bookmarks',requireUser,async(req,res)=>{try{const s=await db.collection('bookmarks').where('userId','==',req.user.id).limit(80).get();const ids=s.docs.map(d=>d.data().postId);const rows=[];for(const id of ids){const p=await db.collection('posts').doc(id).get();if(p.exists)rows.push({id:p.id,...p.data()})}rows.sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows,req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/search',requireUser,async(req,res)=>{try{const q=clean(req.query.q,60).toLowerCase();if(!q)return res.json({users:[]});const s=await db.collection('users').orderBy('username').startAt(q).endAt(q+'\uf8ff').limit(20).get();res.json({users:s.docs.map(d=>safe({id:d.id,...d.data()}))})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/users/search',requireUser,async(req,res)=>{req.url='/api/search?q='+encodeURIComponent(req.query.q||'');return app._router.handle(req,res,()=>{})});
-app.get('/api/users/:username',requireUser,async(req,res)=>{try{const s=await db.collection('users').doc(username(req.params.username)).get();if(!s.exists)return res.status(404).json({error:'User not found.'});const u={id:s.id,...s.data()},f=await db.collection('follows').doc(`${req.user.id}_${s.id}`).get();res.json({user:safe(u),following:f.exists})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/users/:username/follow',requireUser,async(req,res)=>{try{const target=username(req.params.username);if(target===req.user.id)throw Error('You cannot follow yourself.');const t=await getUser(target);if(!t)throw Error('User not found.');const ref=db.collection('follows').doc(`${req.user.id}_${target}`),s=await ref.get();if(s.exists){await ref.delete();await db.collection('users').doc(req.user.id).update({followingCount:FV.increment(-1)});await db.collection('users').doc(target).update({followersCount:FV.increment(-1)});res.json({ok:true,following:false})}else{await ref.set({followerId:req.user.id,followingId:target,createdAt:stamp()});await db.collection('users').doc(req.user.id).update({followingCount:FV.increment(1)});await db.collection('users').doc(target).update({followersCount:FV.increment(1)});await notify(target,req.user.id,'follow',`${req.user.displayName} started following you`);res.json({ok:true,following:true})}}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/users/:username/posts',requireUser,async(req,res)=>{try{const s=await db.collection('posts').where('authorId','==',username(req.params.username)).limit(100).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows,req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
-async function people(usernameVal,type){const s=await db.collection('follows').where(type==='followers'?'followingId':'followerId','==',usernameVal).limit(100).get();const ids=s.docs.map(d=>type==='followers'?d.data().followerId:d.data().followingId);const out=[];for(const id of ids){const u=await getUser(id);if(u)out.push(safe(u))}return out}
-app.get('/api/users/:username/followers',requireUser,async(req,res)=>{try{res.json({users:await people(username(req.params.username),'followers')})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/users/:username/following',requireUser,async(req,res)=>{try{res.json({users:await people(username(req.params.username),'following')})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/suggestions',requireUser,async(req,res)=>{try{const fs=await db.collection('follows').where('followerId','==',req.user.id).get();const excluded=new Set([req.user.id,...fs.docs.map(d=>d.data().followingId)]);const s=await db.collection('users').limit(30).get();res.json({users:s.docs.map(d=>safe({id:d.id,...d.data()})).filter(u=>!excluded.has(u.id)).slice(0,6)})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/trending',requireUser,async(req,res)=>{try{const s=await db.collection('posts').limit(150).get(),counts={};for(const d of s.docs){const text=d.data().text||'';for(const t of text.match(/#[a-z0-9_]+/gi)||[]){const tag=t.toLowerCase();counts[tag]=(counts[tag]||0)+1}}const trends=Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([tag,count])=>({tag,count}));res.json({trends})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/notifications',requireUser,async(req,res)=>{try{const s=await db.collection('notifications').where('userId','==',req.user.id).limit(80).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));const out=[];for(const n of rows){const u=await getUser(n.actorId);out.push({...n,actor:u?safe(u):null})}res.json({notifications:out,count:req.query.unread==='1'?rows.filter(x=>!x.read).length:rows.length})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/notifications/read',requireUser,async(req,res)=>{try{const s=await db.collection('notifications').where('userId','==',req.user.id).where('read','==',false).limit(100).get();await Promise.all(s.docs.map(d=>d.ref.update({read:true})));res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
-function chatId(a,b){return [a,b].sort().join('__')}
-app.get('/api/messages',requireUser,async(req,res)=>{try{const s=await db.collection('conversations').where('participants','array-contains',req.user.id).limit(50).get();const rows=[];for(const d of s.docs){const x=d.data(),other=x.participants.find(p=>p!==req.user.id),u=await getUser(other);if(u)rows.push({id:d.id,lastMessage:x.lastMessage||'',updatedAt:x.updatedAt,user:safe(u)})}rows.sort((a,b)=>(b.updatedAt?._seconds||0)-(a.updatedAt?._seconds||0));res.json({conversations:rows})}catch(e){res.status(500).json({error:e.message})}});
-app.get('/api/messages/:username',requireUser,async(req,res)=>{try{const u=await getUser(username(req.params.username));if(!u)return res.status(404).json({error:'User not found.'});const cid=chatId(req.user.id,u.id),c=await db.collection('conversations').doc(cid).get();if(!c.exists)return res.json({user:safe(u),messages:[]});const s=await c.ref.collection('messages').limit(100).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(a.createdAt?._seconds||0)-(b.createdAt?._seconds||0));res.json({user:safe(u),messages:rows})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/messages/:username',requireUser,async(req,res)=>{try{const u=await getUser(username(req.params.username));if(!u)return res.status(404).json({error:'User not found.'});const text=clean(req.body.text,2000),imageUrl=clean(req.body.imageUrl,1000);if(!text&&!imageUrl)throw Error('Message is empty.');const cid=chatId(req.user.id,u.id),ref=db.collection('conversations').doc(cid);await ref.set({participants:[req.user.id,u.id],lastMessage:text||'📷 Photo',updatedAt:stamp()},{merge:true});await ref.collection('messages').add({senderId:req.user.id,receiverId:u.id,text,imageUrl,createdAt:stamp()});await notify(u.id,req.user.id,'message',`${req.user.displayName} sent you a message`);res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
-function requireAdmin(req,res,next){const adminUser=process.env.ADMIN_USERNAME; if(!adminUser||currentId(req)!==adminUser)return res.status(403).json({error:'Admin access required.'}); next();}
-app.get('/api/admin/users',requireAdmin,async(req,res)=>{try{const s=await db.collection('users').orderBy('createdAt','desc').limit(50).get();res.json({users:s.docs.map(d=>safe({id:d.id,...d.data()}))})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/admin/users/:username/verify',requireAdmin,async(req,res)=>{try{const ref=db.collection('users').doc(username(req.params.username)),s=await ref.get();if(!s.exists)throw Error('User not found.');await ref.update({verified:!s.data().verified});res.json({ok:true,verified:!s.data().verified})}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/admin/posts',requireAdmin,async(req,res)=>{try{const s=await db.collection('posts').orderBy('createdAt','desc').limit(50).get();res.json({posts:await attachUsers(s.docs.map(d=>({id:d.id,...d.data()})),null)})}catch(e){res.status(500).json({error:e.message})}});
-app.delete('/api/admin/posts/:id',requireAdmin,async(req,res)=>{try{const ref=db.collection('posts').doc(req.params.id),s=await ref.get();if(!s.exists)throw Error('Post not found.');await ref.delete();res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
-app.get('/api/admin/stats',async(req,res)=>{const adminUser=process.env.ADMIN_USERNAME;if(!adminUser||currentId(req)!==adminUser)return res.status(403).json({error:'Admin access required.'});try{const [u,p,f,n]=await Promise.all([db.collection('users').get(),db.collection('posts').get(),db.collection('follows').get(),db.collection('notifications').get()]);res.json({users:u.size,posts:p.size,follows:f.size,notifications:n.size})}catch(e){res.status(500).json({error:e.message})}});
-app.use(express.static('.'));
-module.exports=app;
+const express = require('express');
+const crypto = require('crypto');
+const multer = require('multer');
+const { getApps, initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
+
+function env(name) { return process.env[name] || ''; }
+function getFirebaseApp() {
+  if (getApps().length) return getApps()[0];
+  const raw = env('FIREBASE_SERVICE_ACCOUNT_JSON');
+  if (raw) {
+    let svc;
+    try { svc = JSON.parse(raw); } catch { throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is invalid JSON'); }
+    if (!svc.private_key || typeof svc.private_key !== 'string') throw new Error('Firebase service account is missing private_key');
+    return initializeApp({ credential: cert(svc) });
+  }
+  const privateKey = env('FIREBASE_PRIVATE_KEY').replace(/\\n/g, '\n');
+  if (env('FIREBASE_PROJECT_ID') && env('FIREBASE_CLIENT_EMAIL') && privateKey) {
+    return initializeApp({ credential: cert({ projectId: env('FIREBASE_PROJECT_ID'), clientEmail: env('FIREBASE_CLIENT_EMAIL'), privateKey }) });
+  }
+  throw new Error('Firebase service account is not configured');
+}
+let db;
+function firestore() { if (!db) db = getFirestore(getFirebaseApp()); return db; }
+
+function send(res, status, body) { return res.status(status).json(body); }
+function ok(res, data={}) { return send(res, 200, { ok: true, ...data }); }
+function fail(res, message, status=400) { return send(res, status, { ok: false, error: message }); }
+
+const COOKIE = 'bluewave_session';
+function b64(s) { return Buffer.from(s).toString('base64url'); }
+function sign(value) { return crypto.createHmac('sha256', env('SESSION_SECRET') || 'dev-secret').update(value).digest('base64url'); }
+function makeSession(uid, role='user') {
+  const payload = { uid, role, exp: Date.now() + 1000 * 60 * 60 * 24 * 14 };
+  const body = b64(JSON.stringify(payload));
+  return `${body}.${sign(body)}`;
+}
+function parseCookies(header='') { return Object.fromEntries(header.split(';').map(x=>x.trim()).filter(Boolean).map(x=>{const i=x.indexOf('=');return i<0?[x,'']:[x.slice(0,i),decodeURIComponent(x.slice(i+1))]})); }
+function currentSession(req) {
+  const token = parseCookies(req.headers.cookie || '')[COOKIE];
+  if (!token) return null;
+  const [body, sig] = token.split('.');
+  if (!body || !sig || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(sign(body)))) return null;
+  try { const p = JSON.parse(Buffer.from(body,'base64url').toString()); if (!p.exp || p.exp < Date.now()) return null; return p; } catch { return null; }
+}
+function setSession(res, uid, role='user') {
+  const token = makeSession(uid, role);
+  res.setHeader('Set-Cookie', `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
+}
+function clearSession(res) { res.setHeader('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`); }
+async function requireUser(req, res) { const s = currentSession(req); if (!s || s.role !== 'user') { fail(res,'Please login',401); return null; } return s; }
+async function requireAdmin(req,res) { const s=currentSession(req); if (!s || s.role!=='admin') { fail(res,'Admin only',403); return null; } return s; }
+
+async function hashPassword(password, saltHex) {
+  const salt = saltHex || crypto.randomBytes(16).toString('hex');
+  const hash = await new Promise((resolve,reject)=>crypto.scrypt(password,salt,64,(e,d)=>e?reject(e):resolve(d.toString('hex'))));
+  return { salt, hash };
+}
+async function verifyPassword(password, salt, expected) {
+  const {hash}=await hashPassword(password,salt);
+  return crypto.timingSafeEqual(Buffer.from(hash,'hex'), Buffer.from(expected,'hex'));
+}
+
+app.get('/api/health', async (req,res)=>{
+  try { firestore(); return ok(res,{service:'bluewave',firebaseConfigured:true,imgbbConfigured:Boolean(env('IMGBB_API_KEY'))}); }
+  catch(e){ return fail(res,e.message,500); }
+});
+
+app.post('/api/auth/register', async (req,res)=>{
+  try {
+    const email=String(req.body.email||'').trim().toLowerCase();
+    const username=String(req.body.username||'').trim().toLowerCase().replace(/[^a-z0-9_]/g,'').slice(0,24);
+    const name=String(req.body.name||'').trim().slice(0,60);
+    const password=String(req.body.password||'');
+    if(!email.includes('@')||!username||!name||password.length<6) return fail(res,'Enter valid email, username, name and a 6+ character password');
+    const users=firestore().collection('users');
+    const existing=await users.where('email','==',email).limit(1).get();
+    if(!existing.empty) return fail(res,'Email already registered',409);
+    const byUser=await users.where('username','==',username).limit(1).get();
+    if(!byUser.empty) return fail(res,'Username already taken',409);
+    const {salt,hash}=await hashPassword(password);
+    const ref=users.doc();
+    const user={uid:ref.id,email,username,name,passwordHash:hash,passwordSalt:salt,photoURL:'',coverURL:'',bio:'',followersCount:0,followingCount:0,role:'user',createdAt:Date.now(),lastSeenAt:Date.now()};
+    await ref.set(user); setSession(res,ref.id,'user'); return ok(res,{user:{...user,passwordHash:undefined,passwordSalt:undefined}});
+  } catch(e){ return fail(res,e.message,500); }
+});
+
+app.post('/api/auth/login', async (req,res)=>{
+  try {
+    const email=String(req.body.email||'').trim().toLowerCase(); const password=String(req.body.password||'');
+    const s=await firestore().collection('users').where('email','==',email).limit(1).get();
+    if(s.empty) return fail(res,'Invalid email or password',401);
+    const d=s.docs[0].data(); if(!await verifyPassword(password,d.passwordSalt,d.passwordHash)) return fail(res,'Invalid email or password',401);
+    await s.docs[0].ref.update({lastSeenAt:Date.now()}); setSession(res,d.uid,'user'); return ok(res,{user:{...d,passwordHash:undefined,passwordSalt:undefined}});
+  } catch(e){ return fail(res,e.message,500); }
+});
+app.post('/api/auth/logout',(req,res)=>{clearSession(res);return ok(res);});
+app.get('/api/auth/me', async (req,res)=>{try{const s=currentSession(req);if(!s)return ok(res,{user:null});const d=await firestore().collection('users').doc(s.uid).get();if(!d.exists)return ok(res,{user:null});const u=d.data();return ok(res,{user:{...u,passwordHash:undefined,passwordSalt:undefined,uid:d.id}})}catch(e){return fail(res,e.message,500)}});
+
+async function userDoc(uid){ const d=await firestore().collection('users').doc(uid).get(); return d.exists?{id:d.id,...d.data()}:null; }
+
+app.get('/api/feed', async (req,res)=>{
+  try {
+    const s=currentSession(req); if(!s) return fail(res,'Please login',401);
+    const me=await userDoc(s.uid); if(!me) return fail(res,'User not found',404);
+    const following=await firestore().collection('users').doc(s.uid).collection('following').limit(200).get();
+    const ids=new Set([s.uid,...following.docs.map(d=>d.id)]);
+    const posts=await firestore().collection('posts').orderBy('createdAt','desc').limit(80).get();
+    const data=[]; for(const d of posts.docs){const p={id:d.id,...d.data()}; if(ids.has(p.authorId) || req.query.mode==='explore'){
+      const author=await userDoc(p.authorId); p.author=author?{uid:author.id,name:author.name,username:author.username,photoURL:author.photoURL}:null; data.push(p);
+    }}
+    return ok(res,{posts:data.slice(0,50)});
+  }catch(e){return fail(res,e.message,500)}
+});
+
+app.post('/api/posts', async (req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const text=String(req.body.text||'').trim().slice(0,500);const imageURL=String(req.body.imageURL||'');if(!text&&!imageURL)return fail(res,'Post cannot be empty');const u=await userDoc(s.uid);const ref=firestore().collection('posts').doc();await ref.set({authorId:s.uid,text,imageURL,createdAt:Date.now(),likeCount:0,commentCount:0,shareCount:0});return ok(res,{post:{id:ref.id,author:{uid:s.uid,name:u.name,username:u.username,photoURL:u.photoURL},text,imageURL,createdAt:Date.now(),likeCount:0,commentCount:0,shareCount:0}})}catch(e){return fail(res,e.message,500)}});
+app.delete('/api/posts/:id',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const ref=firestore().collection('posts').doc(req.params.id);const d=await ref.get();if(!d.exists)return fail(res,'Post not found',404);if(d.data().authorId!==s.uid)return fail(res,'Forbidden',403);await ref.delete();return ok(res)}catch(e){return fail(res,e.message,500)}});
+app.post('/api/posts/:id/bookmark',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const r=firestore().collection('users').doc(s.uid).collection('bookmarks').doc(req.params.id);const x=await r.get();if(x.exists){await r.delete();return ok(res,{bookmarked:false})}await r.set({postId:req.params.id,createdAt:Date.now()});return ok(res,{bookmarked:true})}catch(e){return fail(res,e.message,500)}});
+app.post('/api/posts/:id/share',async(req,res)=>{try{await firestore().collection('posts').doc(req.params.id).update({shareCount:FieldValue.increment(1)});return ok(res)}catch(e){return fail(res,e.message,500)}});
+
+app.post('/api/posts/:id/like',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const p=firestore().collection('posts').doc(req.params.id);const l=p.collection('likes').doc(s.uid);const x=await l.get();if(x.exists){await l.delete();await p.update({likeCount:FieldValue.increment(-1)});return ok(res,{liked:false})}await l.set({createdAt:Date.now()});await p.update({likeCount:FieldValue.increment(1)});const pd=await p.get();if(pd.data()?.authorId!==s.uid)await firestore().collection('users').doc(pd.data().authorId).collection('notifications').doc().set({type:'like',postId:req.params.id,fromUserId:s.uid,createdAt:Date.now(),read:false});return ok(res,{liked:true})}catch(e){return fail(res,e.message,500)}});
+app.post('/api/posts/:id/comments',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const text=String(req.body.text||'').trim().slice(0,500);if(!text)return fail(res,'Comment is empty');const u=await userDoc(s.uid);const p=firestore().collection('posts').doc(req.params.id);const r=p.collection('comments').doc();await r.set({userId:s.uid,userName:u.name,username:u.username,text,createdAt:Date.now()});await p.update({commentCount:FieldValue.increment(1)});return ok(res,{comment:{id:r.id,userName:u.name,username:u.username,text,createdAt:Date.now()}})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/posts/:id/comments',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const x=await firestore().collection('posts').doc(req.params.id).collection('comments').orderBy('createdAt','asc').limit(100).get();return ok(res,{comments:x.docs.map(d=>({id:d.id,...d.data()}))})}catch(e){return fail(res,e.message,500)}});
+
+app.post('/api/users/:id/follow',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;if(req.params.id===s.uid)return fail(res,'Cannot follow yourself');const meRef=firestore().collection('users').doc(s.uid), targetRef=firestore().collection('users').doc(req.params.id);const t=await targetRef.get();if(!t.exists)return fail(res,'User not found',404);const f=targetRef.collection('followers').doc(s.uid), g=meRef.collection('following').doc(req.params.id);const x=await f.get();if(x.exists){await f.delete();await g.delete();await targetRef.update({followersCount:FieldValue.increment(-1)});await meRef.update({followingCount:FieldValue.increment(-1)});return ok(res,{following:false})}await f.set({uid:s.uid,createdAt:Date.now()});await g.set({uid:req.params.id,createdAt:Date.now()});await targetRef.update({followersCount:FieldValue.increment(1)});await meRef.update({followingCount:FieldValue.increment(1)});await targetRef.collection('notifications').doc().set({type:'follow',fromUserId:s.uid,fromName:(await userDoc(s.uid)).name,createdAt:Date.now(),read:false});return ok(res,{following:true})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/users/search',async(req,res)=>{try{const q=String(req.query.q||'').toLowerCase().trim();if(!q)return ok(res,{users:[]});const x=await firestore().collection('users').orderBy('username').startAt(q).endAt(q+'\uf8ff').limit(20).get();return ok(res,{users:x.docs.map(d=>{const u=d.data();return {uid:d.id,name:u.name,username:u.username,photoURL:u.photoURL,bio:u.bio}})})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/users/suggestions',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const follow=await firestore().collection('users').doc(s.uid).collection('following').get();const ids=new Set(follow.docs.map(d=>d.id));const x=await firestore().collection('users').orderBy('createdAt','desc').limit(30).get();return ok(res,{users:x.docs.map(d=>({uid:d.id,...d.data()})).filter(u=>u.uid!==s.uid&&!ids.has(u.uid)).slice(0,8).map(u=>({uid:u.uid,name:u.name,username:u.username,photoURL:u.photoURL,bio:u.bio}))})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/users/:id',async(req,res)=>{try{const s=currentSession(req);const u=await userDoc(req.params.id);if(!u)return fail(res,'User not found',404);let following=false;if(s&&s.uid!==req.params.id)following=(await firestore().collection('users').doc(s.uid).collection('following').doc(req.params.id).get()).exists;return ok(res,{user:{uid:u.id,name:u.name,username:u.username,bio:u.bio,photoURL:u.photoURL,coverURL:u.coverURL,followersCount:u.followersCount||0,followingCount:u.followingCount||0},following})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/users/:id/followers',async(req,res)=>{try{const x=await firestore().collection('users').doc(req.params.id).collection('followers').limit(200).get();const users=[];for(const d of x.docs){const u=await userDoc(d.id);if(u)users.push({uid:u.id,name:u.name,username:u.username,photoURL:u.photoURL})}return ok(res,{users})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/users/:id/following',async(req,res)=>{try{const x=await firestore().collection('users').doc(req.params.id).collection('following').limit(200).get();const users=[];for(const d of x.docs){const u=await userDoc(d.id);if(u)users.push({uid:u.id,name:u.name,username:u.username,photoURL:u.photoURL})}return ok(res,{users})}catch(e){return fail(res,e.message,500)}});
+
+app.put('/api/profile',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const updates={name:String(req.body.name||'').trim().slice(0,60),bio:String(req.body.bio||'').slice(0,280),photoURL:String(req.body.photoURL||''),coverURL:String(req.body.coverURL||'')};await firestore().collection('users').doc(s.uid).update(updates);return ok(res,{user:{uid:s.uid,...updates}})}catch(e){return fail(res,e.message,500)}});
+
+async function chatIdFor(a,b){return [a,b].sort().join('_');}
+app.get('/api/chats',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const x=await firestore().collection('chats').where('members','array-contains',s.uid).limit(50).get();const chats=[];for(const d of x.docs){const c=d.data();const other=c.members.find(id=>id!==s.uid);const u=other?await userDoc(other):null;chats.push({id:d.id,other:u?{uid:u.id,name:u.name,username:u.username,photoURL:u.photoURL}:null,lastMessage:c.lastMessage||'',updatedAt:c.updatedAt||0})}chats.sort((a,b)=>b.updatedAt-a.updatedAt);return ok(res,{chats})}catch(e){return fail(res,e.message,500)}});
+app.post('/api/chats/open',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const other=String(req.body.userId||'');if(!other||other===s.uid)return fail(res,'Invalid user');const id=await chatIdFor(s.uid,other);const ref=firestore().collection('chats').doc(id);if(!(await ref.get()).exists)await ref.set({members:[s.uid,other],createdAt:Date.now(),updatedAt:Date.now(),lastMessage:''});return ok(res,{chatId:id})}catch(e){return fail(res,e.message,500)}});
+app.get('/api/chats/:id/messages',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const c=await firestore().collection('chats').doc(req.params.id).get();if(!c.exists||!c.data().members.includes(s.uid))return fail(res,'Forbidden',403);const x=await firestore().collection('chats').doc(req.params.id).collection('messages').orderBy('createdAt','asc').limit(200).get();return ok(res,{messages:x.docs.map(d=>({id:d.id,...d.data()}))})}catch(e){return fail(res,e.message,500)}});
+app.post('/api/chats/:id/messages',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const c=await firestore().collection('chats').doc(req.params.id).get();if(!c.exists||!c.data().members.includes(s.uid))return fail(res,'Forbidden',403);const text=String(req.body.text||'').trim().slice(0,2000);const imageURL=String(req.body.imageURL||'');if(!text&&!imageURL)return fail(res,'Message is empty');const r=firestore().collection('chats').doc(req.params.id).collection('messages').doc();const m={senderId:s.uid,text,imageURL,createdAt:Date.now(),seen:false};await r.set(m);await firestore().collection('chats').doc(req.params.id).update({lastMessage:text||'📷 Photo',updatedAt:Date.now()});return ok(res,{message:{id:r.id,...m}})}catch(e){return fail(res,e.message,500)}});
+
+app.get('/api/notifications',async(req,res)=>{try{const s=await requireUser(req,res);if(!s)return;const x=await firestore().collection('users').doc(s.uid).collection('notifications').orderBy('createdAt','desc').limit(50).get();return ok(res,{notifications:x.docs.map(d=>({id:d.id,...d.data()}))})}catch(e){return fail(res,e.message,500)}});
+
+app.get('/api/trending',async(req,res)=>{try{const posts=await firestore().collection('posts').orderBy('createdAt','desc').limit(200).get();const map={};for(const d of posts.docs){const text=d.data().text||'';for(const t of text.match(/#[a-z0-9_]+/gi)||[])map[t.toLowerCase()]=(map[t.toLowerCase()]||0)+1}return ok(res,{hashtags:Object.entries(map).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([tag,count])=>({tag,count}))})}catch(e){return fail(res,e.message,500)}});
+
+app.post('/api/upload', upload.single('file'), async(req,res)=>{try{if(!env('IMGBB_API_KEY'))return fail(res,'IMGBB_API_KEY is not configured',500);if(!req.file)return fail(res,'No file uploaded');const fd=new FormData();fd.append('key',env('IMGBB_API_KEY'));fd.append('image',req.file.buffer.toString('base64'));const r=await fetch('https://api.imgbb.com/1/upload',{method:'POST',body:fd});const d=await r.json();if(!r.ok||!d.success)return fail(res,d?.error?.message||'ImgBB upload failed',502);return ok(res,{url:d.data.url,display_url:d.data.display_url,thumb_url:d.data.thumb?.url||d.data.url})}catch(e){return fail(res,e.message,500)}});
+
+app.post('/api/admin/login',async(req,res)=>{const u=String(req.body.username||'');const p=String(req.body.password||'');if(u===env('ADMIN_USERNAME')&&p===env('ADMIN_PASSWORD')){setSession(res,'admin','admin');return ok(res)}return fail(res,'Invalid admin credentials',401)});
+app.post('/api/admin/logout',(req,res)=>{clearSession(res);return ok(res)});
+app.get('/api/admin/data',async(req,res)=>{try{const s=await requireAdmin(req,res);if(!s)return;const dbx=firestore();const [usersSnap,postsSnap]=await Promise.all([dbx.collection('users').orderBy('createdAt','desc').limit(200).get(),dbx.collection('posts').orderBy('createdAt','desc').limit(200).get()]);const users=usersSnap.docs.map(d=>{const u=d.data();return {uid:d.id,name:u.name,email:u.email,username:u.username,photoURL:u.photoURL,role:u.role,createdAt:u.createdAt,followersCount:u.followersCount||0,followingCount:u.followingCount||0,lastSeenAt:u.lastSeenAt||0}});const posts=postsSnap.docs.map(d=>({id:d.id,...d.data()}));return ok(res,{stats:{users:users.length,posts:posts.length,online:users.filter(u=>Date.now()-u.lastSeenAt<120000).length},users,posts})}catch(e){return fail(res,e.message,500)}});
+app.delete('/api/admin/posts/:id',async(req,res)=>{try{const s=await requireAdmin(req,res);if(!s)return;await firestore().collection('posts').doc(req.params.id).delete();return ok(res)}catch(e){return fail(res,e.message,500)}});
+app.post('/api/admin/users/:id/role',async(req,res)=>{try{const s=await requireAdmin(req,res);if(!s)return;const role=req.body.role==='admin'?'admin':'user';await firestore().collection('users').doc(req.params.id).update({role});return ok(res)}catch(e){return fail(res,e.message,500)}});
+
+app.use((err,req,res,next)=>{console.error(err);return fail(res,'Server error',500)});
+module.exports = app;
