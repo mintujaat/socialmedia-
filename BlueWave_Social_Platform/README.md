@@ -1,25 +1,28 @@
-# BlueWave Social Platform
+# BlueWave Social Platform v3
 
-A Vercel-ready social network using Firebase Firestore for data and ImgBB for all images.
+## Included
+- Login/register with signed HttpOnly session
+- Home feed and Explore
+- Text/photo posts
+- Likes, comments, bookmarks, shares
+- Profiles, edit profile, followers/following
+- Search and people suggestions
+- Notifications
+- 1-to-1 private chat with photo messages
+- Trending hashtags
+- Admin dashboard and post moderation
+- All images uploaded through the server to ImgBB; Firebase Storage is not required
+- Responsive white + blue UI for desktop and mobile
 
 ## Vercel environment variables
-
-- `FIREBASE_SERVICE_ACCOUNT_JSON` — full Firebase service-account JSON
-- `FIREBASE_DATABASE_URL` — optional; only needed if you also use Realtime Database
-- `IMGBB_API_KEY` — ImgBB API key
-- `SESSION_SECRET` — long random secret for login cookies
-- `ADMIN_USERNAME` — optional username allowed to view `/api/admin/stats`
+FIREBASE_SERVICE_ACCOUNT_JSON = complete Firebase service account JSON
+SESSION_SECRET = long random secret
+IMGBB_API_KEY = ImgBB API key
+ADMIN_USERNAME = optional admin username
+FIREBASE_DATABASE_URL = optional
 
 ## Firebase
+Create Firestore Database in the new Firebase project. The backend uses Firebase Admin SDK, so the browser never needs Firebase credentials and Firebase Storage is not used.
 
-Create Firestore in the new Firebase project. The app uses the Firebase Admin SDK, so Firestore rules are bypassed by the server; still keep normal client rules locked down because this app does not use the client SDK for data access.
-
-Collections created automatically: `users`, `posts`, `postLikes`, `comments`, `bookmarks`, `follows`, `notifications`, `conversations` (with `messages` subcollections).
-
-## Images
-
-Profile photos, post photos and chat photos all go through `/api/media/upload` to ImgBB. Only the resulting URL is stored in Firestore. Firebase Storage is not used.
-
-## Deploy
-
-Set the Vercel Root Directory to `BlueWave_Social_Platform` if this folder is nested inside a larger GitHub repository. No build command is required. Redeploy after setting environment variables.
+## Vercel
+Set Root Directory to the folder containing index.html, app.js, style.css, api/, package.json and vercel.json. Leave Build Command and Output Directory at their defaults. Redeploy after environment variables are added.
