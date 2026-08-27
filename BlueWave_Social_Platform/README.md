@@ -1,28 +1,19 @@
-# BlueWave Social Platform v3
+# BlueWave Social Platform
 
-## Included
-- Login/register with signed HttpOnly session
-- Home feed and Explore
-- Text/photo posts
-- Likes, comments, bookmarks, shares
-- Profiles, edit profile, followers/following
-- Search and people suggestions
-- Notifications
-- 1-to-1 private chat with photo messages
-- Trending hashtags
-- Admin dashboard and post moderation
-- All images uploaded through the server to ImgBB; Firebase Storage is not required
-- Responsive white + blue UI for desktop and mobile
+A Vercel-ready social web app using:
+- Express + Firebase Admin / Firestore
+- ImgBB for profile, post and chat images
+- Signed HttpOnly session cookie auth
+- Single-page user experience in `index.html`
+- Separate `admin.html` control panel
 
 ## Vercel environment variables
-FIREBASE_SERVICE_ACCOUNT_JSON = complete Firebase service account JSON
-SESSION_SECRET = long random secret
-IMGBB_API_KEY = ImgBB API key
-ADMIN_USERNAME = optional admin username
-FIREBASE_DATABASE_URL = optional
+- `FIREBASE_SERVICE_ACCOUNT_JSON` (full service-account JSON)
+- `IMGBB_API_KEY`
+- `SESSION_SECRET` (long random string)
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD`
 
-## Firebase
-Create Firestore Database in the new Firebase project. The backend uses Firebase Admin SDK, so the browser never needs Firebase credentials and Firebase Storage is not used.
-
-## Vercel
-Set Root Directory to the folder containing index.html, app.js, style.css, api/, package.json and vercel.json. Leave Build Command and Output Directory at their defaults. Redeploy after environment variables are added.
+## Deploy
+Set the Vercel Root Directory to the folder containing `index.html`, `api/`, `package.json`, and `vercel.json`.
+No Firebase Storage is required.

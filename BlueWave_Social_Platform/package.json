@@ -1,10 +1,1 @@
-{
-  "name": "bluewave-social",
-  "version": "3.0.0",
-  "private": true,
-  "engines": { "node": ">=20" },
-  "dependencies": {
-    "express": "^5.1.0",
-    "firebase-admin": "^13.4.0"
-  }
-}
+{"name":"bluewave-social","version":"3.0.0","private":true,"engines":{"node":">=20"},"dependencies":{"express":"^5.1.0","firebase-admin":"^13.4.0"}}
