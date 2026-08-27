@@ -1,421 +1,57 @@
-const express = require('express');
-const crypto = require('crypto');
-const admin = require('firebase-admin');
-
-const app = express();
-app.disable('x-powered-by');
-app.use(express.json({ limit: '12mb' }));
-
-const env = process.env;
-const SERVICE_JSON = env.FIREBASE_SERVICE_ACCOUNT_JSON;
-if (!admin.apps.length) {
-  if (!SERVICE_JSON) throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_JSON');
-  let creds;
-  try { creds = JSON.parse(SERVICE_JSON); } catch { throw new Error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON'); }
-  admin.initializeApp({ credential: admin.credential.cert(creds) });
-}
-const db = admin.firestore();
-const FV = admin.firestore.FieldValue;
-const SECRET = env.SESSION_SECRET || '';
-const ADMIN_USERNAME = (env.ADMIN_USERNAME || '').trim().toLowerCase();
-const ADMIN_PASSWORD = env.ADMIN_PASSWORD || '';
-
-const clean = (v, max = 1000) => String(v ?? '').trim().slice(0, max);
-const normalizeUsername = (v) => clean(v, 24).toLowerCase().replace(/[^a-z0-9_.-]/g, '');
-const nowIso = () => new Date().toISOString();
-
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  return new Promise((resolve, reject) => crypto.scrypt(String(password), salt, 64, (err, key) => err ? reject(err) : resolve(`${salt}:${key.toString('hex')}`)));
-}
-function verifyPassword(password, stored) {
-  return new Promise((resolve, reject) => {
-    const [salt, hex] = String(stored || '').split(':');
-    if (!salt || !hex) return resolve(false);
-    crypto.scrypt(String(password), salt, 64, (err, key) => {
-      if (err) return reject(err);
-      const a = Buffer.from(hex, 'hex');
-      resolve(a.length === key.length && crypto.timingSafeEqual(a, key));
-    });
-  });
-}
-function parseCookies(req) {
-  const out = {};
-  for (const pair of String(req.headers.cookie || '').split(';')) {
-    const i = pair.indexOf('=');
-    if (i < 0) continue;
-    out[pair.slice(0, i).trim()] = decodeURIComponent(pair.slice(i + 1).trim());
-  }
-  return out;
-}
-function signSession(payload) { return crypto.createHmac('sha256', SECRET).update(payload).digest('hex'); }
-function setSession(res, id, days = 30) {
-  const exp = Date.now() + days * 86400000;
-  const payload = `${id}.${exp}`;
-  res.setHeader('Set-Cookie', `bw_session=${encodeURIComponent(`${payload}.${signSession(payload)}`)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${days * 86400}`);
-}
-function clearSession(res) { res.setHeader('Set-Cookie', 'bw_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'); }
-function currentId(req) {
-  if (!SECRET) return null;
-  const raw = parseCookies(req).bw_session || '';
-  const [id, exp, sig] = raw.split('.');
-  if (!id || !exp || !sig || Number(exp) < Date.now()) return null;
-  const expected = signSession(`${id}.${exp}`);
-  if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-  return id;
-}
-async function getUser(id) {
-  if (!id) return null;
-  const snap = await db.collection('users').doc(id).get();
-  return snap.exists ? { id: snap.id, ...snap.data() } : null;
-}
-function safeUser(u) {
-  if (!u) return null;
-  return {
-    id: u.id,
-    username: u.username,
-    displayName: u.displayName || u.username,
-    bio: u.bio || '',
-    avatarUrl: u.avatarUrl || '',
-    coverUrl: u.coverUrl || '',
-    followersCount: Number(u.followersCount || 0),
-    followingCount: Number(u.followingCount || 0),
-    createdAt: u.createdAt || null,
-  };
-}
-async function requireUser(req, res, next) {
-  try {
-    const user = await getUser(currentId(req));
-    if (!user) return res.status(401).json({ error: 'Login required.' });
-    req.user = user;
-    next();
-  } catch (e) { res.status(500).json({ error: e.message }); }
-}
-async function requireAdmin(req, res, next) {
-  try {
-    const id = currentId(req);
-    if (id === '__admin__' && ADMIN_USERNAME && ADMIN_PASSWORD) { req.user = { id: '__admin__', username: ADMIN_USERNAME, displayName: 'Administrator' }; return next(); }
-    const user = await getUser(id);
-    if (!user || !ADMIN_USERNAME || user.username !== ADMIN_USERNAME) return res.status(403).json({ error: 'Admin access required.' });
-    req.user = user;
-    next();
-  } catch (e) { res.status(500).json({ error: e.message }); }
-}
-async function notify(userId, actorId, type, text, postId = '') {
-  if (!userId || !actorId || userId === actorId) return;
-  await db.collection('notifications').add({ userId, actorId, type, text, postId, read: false, createdAt: FV.serverTimestamp() });
-}
-async function uploadToImgBB(data) {
-  const key = env.IMGBB_API_KEY;
-  if (!key) throw new Error('IMGBB_API_KEY is not configured.');
-  const raw = String(data || '').replace(/^data:image\/(?:jpeg|jpg|png|webp|gif);base64,/i, '').replace(/\s/g, '');
-  if (!raw) throw new Error('Invalid image.');
-  const form = new FormData();
-  form.append('key', key);
-  form.append('image', raw);
-  const r = await fetch('https://api.imgbb.com/1/upload', { method: 'POST', body: form });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || !d.success) throw new Error(d.error?.message || 'Image upload failed.');
-  return { url: d.data.url, deleteUrl: d.data.delete_url || '' };
-}
-async function addAuthorAndViewerState(posts, viewerId) {
-  const ids = [...new Set(posts.map(p => p.authorId).filter(Boolean))];
-  const users = {};
-  for (const id of ids) {
-    const u = await getUser(id);
-    if (u) users[id] = safeUser(u);
-  }
-  const out = [];
-  for (const p of posts) {
-    let liked = false, bookmarked = false;
-    if (viewerId) {
-      liked = (await db.collection('postLikes').doc(`${p.id}_${viewerId}`).get()).exists;
-      bookmarked = (await db.collection('bookmarks').doc(`${viewerId}_${p.id}`).get()).exists;
-    }
-    out.push({ ...p, author: users[p.authorId] || null, liked, bookmarked });
-  }
-  return out;
-}
-
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'BlueWave', firebaseConfigured: !!SERVICE_JSON, imgbbConfigured: !!env.IMGBB_API_KEY }));
-
-app.get('/api/auth/me', async (req, res) => { try { res.json({ user: safeUser(await getUser(currentId(req))) }); } catch (e) { res.status(500).json({ error: e.message }); } });
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const username = normalizeUsername(req.body.username);
-    const password = String(req.body.password || '');
-    const displayName = clean(req.body.displayName, 60) || username;
-    if (!/^[a-z0-9_.-]{3,24}$/.test(username)) throw new Error('Username must be 3–24 characters.');
-    if (password.length < 6) throw new Error('Password must be at least 6 characters.');
-    const ref = db.collection('users').doc(username);
-    if ((await ref.get()).exists) throw new Error('Username already exists.');
-    const passwordHash = await hashPassword(password);
-    await ref.set({ username, displayName, bio: '', avatarUrl: '', coverUrl: '', followersCount: 0, followingCount: 0, passwordHash, createdAt: FV.serverTimestamp() });
-    setSession(res, username);
-    res.json({ ok: true, user: safeUser(await getUser(username)) });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const username = normalizeUsername(req.body.username);
-    const user = await getUser(username);
-    if (!user || !(await verifyPassword(req.body.password, user.passwordHash))) throw new Error('Invalid username or password.');
-    setSession(res, username);
-    res.json({ ok: true, user: safeUser(user) });
-  } catch (e) { res.status(401).json({ error: e.message }); }
-});
-app.post('/api/auth/logout', (req, res) => { clearSession(res); res.json({ ok: true }); });
-app.post('/api/admin/login', async (req, res) => {
-  try {
-    const username = normalizeUsername(req.body.username), password = String(req.body.password || '');
-    if (!ADMIN_USERNAME || !ADMIN_PASSWORD || username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) throw new Error('Invalid admin credentials.');
-    setSession(res, '__admin__', 1);
-    res.json({ ok: true });
-  } catch (e) { res.status(401).json({ error: e.message }); }
-});
-
-app.post('/api/media/upload', requireUser, async (req, res) => {
-  try {
-    const data = String(req.body.data || '');
-    if (!/^data:image\/(jpeg|jpg|png|webp|gif);base64,/i.test(data)) throw new Error('Only JPG, PNG, WEBP or GIF images are supported.');
-    if (data.length > 10 * 1024 * 1024) throw new Error('Image is too large.');
-    res.json({ ok: true, ...(await uploadToImgBB(data)) });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-app.post('/api/profile/update', requireUser, async (req, res) => {
-  try {
-    const data = {
-      displayName: clean(req.body.displayName, 60) || req.user.username,
-      bio: clean(req.body.bio, 280),
-      avatarUrl: clean(req.body.avatarUrl, 1200),
-      coverUrl: clean(req.body.coverUrl, 1200),
-    };
-    await db.collection('users').doc(req.user.id).update(data);
-    res.json({ ok: true, user: safeUser(await getUser(req.user.id)) });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-app.get('/api/feed', requireUser, async (req, res) => {
-  try {
-    const follows = await db.collection('follows').where('followerId', '==', req.user.id).get();
-    const ids = [req.user.id, ...follows.docs.map(d => d.data().followingId)].slice(0, 30);
-    const posts = [];
-    for (let i = 0; i < ids.length; i += 10) {
-      const group = ids.slice(i, i + 10);
-      const s = await db.collection('posts').where('authorId', 'in', group).limit(100).get();
-      s.docs.forEach(d => posts.push({ id: d.id, ...d.data() }));
-    }
-    posts.sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
-    res.json({ posts: await addAuthorAndViewerState(posts.slice(0, 80), req.user.id) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/explore', requireUser, async (req, res) => {
-  try {
-    const s = await db.collection('posts').limit(150).get();
-    const posts = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
-    res.json({ posts: await addAuthorAndViewerState(posts.slice(0, 80), req.user.id) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/posts', requireUser, async (req, res) => {
-  try {
-    const text = clean(req.body.text, 1000);
-    const imageUrl = clean(req.body.imageUrl, 1200);
-    if (!text && !imageUrl) throw new Error('Write something or add a photo.');
-    const ref = db.collection('posts').doc();
-    await ref.set({ authorId: req.user.id, text, imageUrl, likesCount: 0, commentsCount: 0, createdAt: FV.serverTimestamp() });
-    res.json({ ok: true, id: ref.id });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.delete('/api/posts/:id', requireUser, async (req, res) => {
-  try {
-    const ref = db.collection('posts').doc(req.params.id), p = await ref.get();
-    if (!p.exists) throw new Error('Post not found.');
-    if (p.data().authorId !== req.user.id) throw new Error('You can only delete your own post.');
-    await ref.delete();
-    res.json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.post('/api/posts/:id/like', requireUser, async (req, res) => {
-  try {
-    const post = await db.collection('posts').doc(req.params.id).get();
-    if (!post.exists) throw new Error('Post not found.');
-    const ref = db.collection('postLikes').doc(`${req.params.id}_${req.user.id}`), exists = await ref.get();
-    let liked;
-    if (exists.exists) { await ref.delete(); await post.ref.update({ likesCount: FV.increment(-1) }); liked = false; }
-    else { await ref.set({ postId: req.params.id, userId: req.user.id, createdAt: FV.serverTimestamp() }); await post.ref.update({ likesCount: FV.increment(1) }); liked = true; await notify(post.data().authorId, req.user.id, 'like', `${req.user.displayName} liked your post`, req.params.id); }
-    const fresh = await post.ref.get();
-    res.json({ ok: true, liked, likesCount: Math.max(0, Number(fresh.data().likesCount || 0)) });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.get('/api/posts/:id/comments', requireUser, async (req, res) => {
-  try {
-    const s = await db.collection('comments').where('postId', '==', req.params.id).limit(100).get();
-    const rows = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.createdAt?._seconds || 0) - (b.createdAt?._seconds || 0));
-    const out = [];
-    for (const c of rows) { const u = await getUser(c.userId); out.push({ ...c, author: safeUser(u) }); }
-    res.json({ comments: out });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/posts/:id/comments', requireUser, async (req, res) => {
-  try {
-    const text = clean(req.body.text, 500);
-    if (!text) throw new Error('Comment is empty.');
-    const post = await db.collection('posts').doc(req.params.id).get();
-    if (!post.exists) throw new Error('Post not found.');
-    await db.collection('comments').add({ postId: req.params.id, userId: req.user.id, text, createdAt: FV.serverTimestamp() });
-    await post.ref.update({ commentsCount: FV.increment(1) });
-    await notify(post.data().authorId, req.user.id, 'comment', `${req.user.displayName} replied to your post`, req.params.id);
-    res.json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.post('/api/posts/:id/bookmark', requireUser, async (req, res) => {
-  try {
-    const ref = db.collection('bookmarks').doc(`${req.user.id}_${req.params.id}`), snap = await ref.get();
-    if (snap.exists) await ref.delete(); else await ref.set({ userId: req.user.id, postId: req.params.id, createdAt: FV.serverTimestamp() });
-    res.json({ ok: true, bookmarked: !snap.exists });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.get('/api/bookmarks', requireUser, async (req, res) => {
-  try {
-    const s = await db.collection('bookmarks').where('userId', '==', req.user.id).limit(100).get();
-    const posts = [];
-    for (const d of s.docs) { const p = await db.collection('posts').doc(d.data().postId).get(); if (p.exists) posts.push({ id: p.id, ...p.data() }); }
-    posts.sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
-    res.json({ posts: await addAuthorAndViewerState(posts, req.user.id) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/users/search', requireUser, async (req, res) => {
-  try {
-    const q = clean(req.query.q, 40).toLowerCase();
-    if (!q) return res.json({ users: [] });
-    const s = await db.collection('users').orderBy('username').startAt(q).endAt(q + '\uf8ff').limit(20).get();
-    res.json({ users: s.docs.map(d => safeUser({ id: d.id, ...d.data() })) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/users/:username', requireUser, async (req, res) => {
-  try {
-    const id = normalizeUsername(req.params.username), u = await getUser(id);
-    if (!u) return res.status(404).json({ error: 'User not found.' });
-    const following = (await db.collection('follows').doc(`${req.user.id}_${id}`).get()).exists;
-    res.json({ user: safeUser(u), following });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/users/:username/posts', requireUser, async (req, res) => {
-  try {
-    const id = normalizeUsername(req.params.username), s = await db.collection('posts').where('authorId', '==', id).limit(100).get();
-    const posts = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
-    res.json({ posts: await addAuthorAndViewerState(posts, req.user.id) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/users/:username/follow', requireUser, async (req, res) => {
-  try {
-    const id = normalizeUsername(req.params.username);
-    if (id === req.user.id) throw new Error('You cannot follow yourself.');
-    const target = await getUser(id); if (!target) throw new Error('User not found.');
-    const ref = db.collection('follows').doc(`${req.user.id}_${id}`), snap = await ref.get();
-    if (snap.exists) {
-      await ref.delete();
-      await db.collection('users').doc(req.user.id).update({ followingCount: FV.increment(-1) });
-      await db.collection('users').doc(id).update({ followersCount: FV.increment(-1) });
-      res.json({ ok: true, following: false });
-    } else {
-      await ref.set({ followerId: req.user.id, followingId: id, createdAt: FV.serverTimestamp() });
-      await db.collection('users').doc(req.user.id).update({ followingCount: FV.increment(1) });
-      await db.collection('users').doc(id).update({ followersCount: FV.increment(1) });
-      await notify(id, req.user.id, 'follow', `${req.user.displayName} started following you`);
-      res.json({ ok: true, following: true });
-    }
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-async function listPeople(usernameId, mode) {
-  const q = mode === 'followers' ? { field: 'followingId', value: usernameId } : { field: 'followerId', value: usernameId };
-  const s = await db.collection('follows').where(q.field, '==', q.value).limit(100).get();
-  const ids = s.docs.map(d => mode === 'followers' ? d.data().followerId : d.data().followingId);
-  const out = []; for (const id of ids) { const u = await getUser(id); if (u) out.push(safeUser(u)); }
-  return out;
-}
-app.get('/api/users/:username/followers', requireUser, async (req, res) => { try { res.json({ users: await listPeople(normalizeUsername(req.params.username), 'followers') }); } catch (e) { res.status(500).json({ error: e.message }); } });
-app.get('/api/users/:username/following', requireUser, async (req, res) => { try { res.json({ users: await listPeople(normalizeUsername(req.params.username), 'following') }); } catch (e) { res.status(500).json({ error: e.message }); } });
-app.get('/api/suggestions', requireUser, async (req, res) => {
-  try {
-    const f = await db.collection('follows').where('followerId', '==', req.user.id).get();
-    const excluded = new Set([req.user.id, ...f.docs.map(d => d.data().followingId)]);
-    const s = await db.collection('users').limit(40).get();
-    res.json({ users: s.docs.map(d => safeUser({ id: d.id, ...d.data() })).filter(u => !excluded.has(u.id)).slice(0, 8) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/trending', requireUser, async (req, res) => {
-  try {
-    const s = await db.collection('posts').limit(250).get(), counts = {};
-    for (const d of s.docs) for (const tag of String(d.data().text || '').match(/#[a-z0-9_]+/gi) || []) counts[tag.toLowerCase()] = (counts[tag.toLowerCase()] || 0) + 1;
-    res.json({ trends: Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([tag, count]) => ({ tag, count })) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/notifications', requireUser, async (req, res) => {
-  try {
-    const s = await db.collection('notifications').where('userId', '==', req.user.id).limit(100).get();
-    const rows = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
-    const out = []; for (const n of rows) { const u = await getUser(n.actorId); out.push({ ...n, actor: safeUser(u) }); }
-    res.json({ notifications: out, unread: rows.filter(x => !x.read).length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/notifications/read', requireUser, async (req, res) => {
-  try { const s = await db.collection('notifications').where('userId', '==', req.user.id).where('read', '==', false).limit(100).get(); await Promise.all(s.docs.map(d => d.ref.update({ read: true }))); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-function conversationId(a, b) { return [a, b].sort().join('__'); }
-app.get('/api/messages', requireUser, async (req, res) => {
-  try {
-    const s = await db.collection('conversations').where('participants', 'array-contains', req.user.id).limit(50).get();
-    const out = [];
-    for (const d of s.docs) { const data = d.data(), other = (data.participants || []).find(x => x !== req.user.id), u = await getUser(other); if (u) out.push({ id: d.id, lastMessage: data.lastMessage || '', updatedAt: data.updatedAt || null, user: safeUser(u) }); }
-    out.sort((a, b) => (b.updatedAt?._seconds || 0) - (a.updatedAt?._seconds || 0)); res.json({ conversations: out });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/messages/:username', requireUser, async (req, res) => {
-  try {
-    const u = await getUser(normalizeUsername(req.params.username)); if (!u) return res.status(404).json({ error: 'User not found.' });
-    const c = await db.collection('conversations').doc(conversationId(req.user.id, u.id)).get();
-    if (!c.exists) return res.json({ user: safeUser(u), messages: [] });
-    const s = await c.ref.collection('messages').limit(150).get();
-    const messages = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.createdAt?._seconds || 0) - (b.createdAt?._seconds || 0));
-    res.json({ user: safeUser(u), messages });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/messages/:username', requireUser, async (req, res) => {
-  try {
-    const u = await getUser(normalizeUsername(req.params.username)); if (!u) return res.status(404).json({ error: 'User not found.' });
-    const text = clean(req.body.text, 2000), imageUrl = clean(req.body.imageUrl, 1200); if (!text && !imageUrl) throw new Error('Message is empty.');
-    const cid = conversationId(req.user.id, u.id), c = db.collection('conversations').doc(cid);
-    await c.set({ participants: [req.user.id, u.id], lastMessage: text || '📷 Photo', updatedAt: FV.serverTimestamp() }, { merge: true });
-    await c.collection('messages').add({ senderId: req.user.id, receiverId: u.id, text, imageUrl, createdAt: FV.serverTimestamp() });
-    await notify(u.id, req.user.id, 'message', `${req.user.displayName} sent you a message`);
-    res.json({ ok: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
-
-// Admin
-app.get('/api/admin/stats', requireAdmin, async (req, res) => {
-  try {
-    const [u, p, f, n] = await Promise.all([db.collection('users').get(), db.collection('posts').get(), db.collection('follows').get(), db.collection('notifications').get()]);
-    res.json({ users: u.size, posts: p.size, follows: f.size, notifications: n.size });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/admin/users', requireAdmin, async (req, res) => {
-  try { const s = await db.collection('users').orderBy('createdAt', 'desc').limit(200).get(); res.json({ users: s.docs.map(d => safeUser({ id: d.id, ...d.data() })) }); } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/admin/users/:username/toggle-verify', requireAdmin, async (req, res) => {
-  try { const ref = db.collection('users').doc(normalizeUsername(req.params.username)), u = await ref.get(); if (!u.exists) throw new Error('User not found.'); await ref.update({ verified: !u.data().verified }); res.json({ ok: true, verified: !u.data().verified }); } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.post('/api/admin/users/:username/toggle-ban', requireAdmin, async (req, res) => {
-  try { const ref = db.collection('users').doc(normalizeUsername(req.params.username)), u = await ref.get(); if (!u.exists) throw new Error('User not found.'); await ref.update({ banned: !u.data().banned }); res.json({ ok: true, banned: !u.data().banned }); } catch (e) { res.status(400).json({ error: e.message }); }
-});
-app.delete('/api/admin/posts/:id', requireAdmin, async (req, res) => { try { await db.collection('posts').doc(req.params.id).delete(); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); } });
-app.get('/api/admin/posts', requireAdmin, async (req, res) => {
-  try { const s = await db.collection('posts').limit(200).get(); const posts = s.docs.map(d => ({ id: d.id, ...d.data() })); posts.sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0)); res.json({ posts: await addAuthorAndViewerState(posts, null) }); } catch(e) { res.status(500).json({error:e.message}); }
-});
-
-app.get('/{*splat}', (req, res, next) => { if (req.path.startsWith('/api/')) return next(); res.sendFile(require('path').join(process.cwd(), 'index.html')); });
-
-module.exports = app;
+const express=require('express'),crypto=require('crypto'),admin=require('firebase-admin');
+const app=express();app.use(express.json({limit:'10mb'}));
+if(!admin.apps.length){const raw=process.env.FIREBASE_SERVICE_ACCOUNT_JSON;if(!raw)throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_JSON');admin.initializeApp({credential:admin.credential.cert(JSON.parse(raw)),databaseURL:process.env.FIREBASE_DATABASE_URL||undefined});}
+const db=admin.firestore(),FV=admin.firestore.FieldValue;
+const SECRET=process.env.SESSION_SECRET||'change-me';
+const clean=(v,m=1000)=>String(v??'').trim().slice(0,m), username=v=>clean(v,30).toLowerCase().replace(/[^a-z0-9_.-]/g,'');
+const uid=()=>crypto.randomBytes(12).toString('hex');
+function sign(v){return crypto.createHmac('sha256',SECRET).update(v).digest('hex')}
+function cookies(req){const out={};for(const part of (req.headers.cookie||'').split(';')){const i=part.indexOf('=');if(i>0)out[part.slice(0,i).trim()]=decodeURIComponent(part.slice(i+1).trim())}return out}
+function setSession(res,id){const exp=Date.now()+30*86400000,body=`${id}.${exp}`;res.setHeader('Set-Cookie',`bw_session=${encodeURIComponent(body+'.'+sign(body))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`)}
+function currentId(req){const p=(cookies(req).bw_session||'').split('.');if(p.length!==3||!p[0]||Number(p[1])<Date.now()||sign(`${p[0]}.${p[1]}`)!==p[2])return null;return p[0]}
+async function getUser(id){if(!id)return null;const s=await db.collection('users').doc(id).get();return s.exists?{id:s.id,...s.data()}:null}
+async function me(req){return getUser(currentId(req))}
+async function requireUser(req,res,next){try{const u=await me(req);if(!u)return res.status(401).json({error:'Login required.'});req.user=u;next()}catch(e){res.status(500).json({error:e.message})}}
+function safe(u){return{id:u.id,username:u.username,email:u.email||'',displayName:u.displayName||u.username,bio:u.bio||'',avatarUrl:u.avatarUrl||'',coverUrl:u.coverUrl||'',verified:!!u.verified,followersCount:u.followersCount||0,followingCount:u.followingCount||0,createdAt:u.createdAt||null}}
+function hashPassword(p,salt=crypto.randomBytes(16).toString('hex')){return new Promise((ok,no)=>crypto.scrypt(String(p),salt,64,(e,b)=>e?no(e):ok(`${salt}:${b.toString('hex')}`)))}
+function checkPassword(p,stored){return new Promise((ok,no)=>{const [salt,h]=String(stored||'').split(':');if(!salt||!h)return ok(false);crypto.scrypt(String(p),salt,64,(e,b)=>e?no(e):ok(crypto.timingSafeEqual(Buffer.from(h,'hex'),b)))})}
+async function imgBB(data){const key=process.env.IMGBB_API_KEY;if(!key)throw Error('IMGBB_API_KEY is not configured.');const raw=String(data).replace(/^data:image\/[^;]+;base64,/i,'').replace(/\s/g,'');const fd=new FormData();fd.append('key',key);fd.append('image',raw);const r=await fetch('https://api.imgbb.com/1/upload',{method:'POST',body:fd});const d=await r.json().catch(()=>({}));if(!r.ok||!d.success)throw Error(d.error?.message||'Image upload failed.');return d.data.url}
+function stamp(){return FV.serverTimestamp()}
+async function notify(userId,actorId,type,text,postId=''){if(!userId||userId===actorId)return;await db.collection('notifications').add({userId,actorId,type,text,postId,read:false,createdAt:stamp()})}
+async function attachUsers(posts,viewerId){const ids=[...new Set(posts.map(p=>p.authorId).filter(Boolean))];const users={};for(let i=0;i<ids.length;i+=10){const docs=await Promise.all(ids.slice(i,i+10).map(x=>db.collection('users').doc(x).get()));docs.forEach(s=>{if(s.exists)users[s.id]=safe({id:s.id,...s.data()})})}const liked=new Set(),saved=new Set();if(viewerId&&posts.length){const likes=await Promise.all(posts.map(p=>db.collection('postLikes').doc(`${p.id}_${viewerId}`).get()));likes.forEach((s,i)=>{if(s.exists)liked.add(posts[i].id)});const marks=await Promise.all(posts.map(p=>db.collection('bookmarks').doc(`${viewerId}_${p.id}`).get()));marks.forEach((s,i)=>{if(s.exists)saved.add(posts[i].id)})}return posts.map(p=>({...p,author:users[p.authorId]||null,liked:liked.has(p.id),bookmarked:saved.has(p.id)}))}
+app.get('/api/health',(req,res)=>res.json({ok:true,service:'BlueWave'}));
+app.get('/api/auth/me',async(req,res)=>{try{const u=await me(req);res.json({user:u?safe(u):null})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/auth/register',async(req,res)=>{try{const email=clean(req.body.email,160).toLowerCase(),un=username(req.body.username),pw=String(req.body.password||'');if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw Error('Please enter a valid email address.');if(!/^[a-z0-9_.-]{3,24}$/.test(un))throw Error('Username must be 3–24 characters.');if(pw.length<6)throw Error('Password must be at least 6 characters.');const ref=db.collection('users').doc(un),old=await ref.get();if(old.exists)throw Error('Username already exists.');const emailSnap=await db.collection('users').where('emailLower','==',email).limit(1).get();if(!emailSnap.empty)throw Error('Email is already registered.');const passwordHash=await hashPassword(pw);await ref.set({username:un,email,emailLower:email,displayName:clean(req.body.displayName,60)||un,bio:'',avatarUrl:'',coverUrl:'',passwordHash,followersCount:0,followingCount:0,verified:false,createdAt:stamp()});setSession(res,un);const u=await ref.get();res.json({ok:true,user:safe({id:ref.id,...u.data()})})}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/auth/login',async(req,res)=>{try{const email=clean(req.body.email,160).toLowerCase(),pw=String(req.body.password||'');if(!email||!pw)throw Error('Email and password are required.');const s=await db.collection('users').where('emailLower','==',email).limit(1).get();if(s.empty)throw Error('Invalid email or password.');const doc=s.docs[0],data=doc.data();if(!(await checkPassword(pw,data.passwordHash)))throw Error('Invalid email or password.');setSession(res,doc.id);res.json({ok:true,user:safe({id:doc.id,...data})})}catch(e){res.status(401).json({error:e.message})}});
+app.post('/api/admin/login',async(req,res)=>{try{const adminUser=clean(process.env.ADMIN_USERNAME,60).toLowerCase(),adminPass=String(process.env.ADMIN_PASSWORD||''),supplied=clean(req.body.username,60).toLowerCase(),pw=String(req.body.password||'');if(!adminUser||!adminPass||supplied!==adminUser||pw!==adminPass)throw Error('Invalid admin credentials.');setSession(res,adminUser);res.json({ok:true})}catch(e){res.status(401).json({error:e.message})}});
+app.post('/api/auth/logout',(req,res)=>{res.setHeader('Set-Cookie','bw_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');res.json({ok:true})});
+app.post('/api/media/upload',requireUser,async(req,res)=>{try{const data=String(req.body.data||'');if(!/^data:image\/(jpeg|jpg|png|webp|gif);base64,/i.test(data))throw Error('Only JPG, PNG, WEBP or GIF images are supported.');if(data.length>9*1024*1024)throw Error('Image is too large.');res.json({ok:true,url:await imgBB(data)})}catch(e){res.status(400).json({error:e.message})}});
+app.get('/api/profile/update',requireUser,(req,res)=>res.status(405).json({error:'Use POST.'}));
+app.post('/api/profile/update',requireUser,async(req,res)=>{try{const data={displayName:clean(req.body.displayName,60)||req.user.username,bio:clean(req.body.bio,280),avatarUrl:clean(req.body.avatarUrl,1000)};await db.collection('users').doc(req.user.id).update(data);const u=await getUser(req.user.id);res.json({ok:true,user:safe(u)})}catch(e){res.status(400).json({error:e.message})}});
+app.get('/api/feed',requireUser,async(req,res)=>{try{const fs=await db.collection('follows').where('followerId','==',req.user.id).get();const ids=[req.user.id,...fs.docs.map(d=>d.data().followingId)];let rows=[];for(let i=0;i<ids.length;i+=10){const s=await db.collection('posts').where('authorId','in',ids.slice(i,i+10)).limit(100).get();rows.push(...s.docs.map(d=>({id:d.id,...d.data()})))}rows.sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows.slice(0,80),req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/explore',requireUser,async(req,res)=>{try{const s=await db.collection('posts').limit(120).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows.slice(0,60),req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/posts',requireUser,async(req,res)=>{try{const text=clean(req.body.text,1000),imageUrl=clean(req.body.imageUrl,1000);if(!text&&!imageUrl)throw Error('Write something or add a photo.');const ref=db.collection('posts').doc();await ref.set({authorId:req.user.id,text,imageUrl,likesCount:0,commentsCount:0,createdAt:stamp()});res.json({ok:true,id:ref.id})}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/posts/:id/like',requireUser,async(req,res)=>{try{const post=await db.collection('posts').doc(req.params.id).get();if(!post.exists)throw Error('Post not found.');const ref=db.collection('postLikes').doc(`${req.params.id}_${req.user.id}`),s=await ref.get();let liked;if(s.exists){await ref.delete();await post.ref.update({likesCount:FV.increment(-1)});liked=false}else{await ref.set({postId:req.params.id,userId:req.user.id,createdAt:stamp()});await post.ref.update({likesCount:FV.increment(1)});liked=true;await notify(post.data().authorId,req.user.id,'like',`${req.user.displayName} liked your post`,req.params.id)}const fresh=await post.ref.get();res.json({ok:true,liked,likesCount:fresh.data().likesCount||0})}catch(e){res.status(400).json({error:e.message})}});
+app.get('/api/posts/:id/comments',requireUser,async(req,res)=>{try{const s=await db.collection('comments').where('postId','==',req.params.id).limit(100).get();const rows=s.docs.map(d=>({id:d.id,...d.data()}));rows.sort((a,b)=>(a.createdAt?._seconds||0)-(b.createdAt?._seconds||0));const out=[];for(const c of rows){const u=await getUser(c.userId);out.push({...c,author:u?safe(u):null})}res.json({comments:out})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/posts/:id/comments',requireUser,async(req,res)=>{try{const text=clean(req.body.text,500);if(!text)throw Error('Comment is empty.');const p=await db.collection('posts').doc(req.params.id).get();if(!p.exists)throw Error('Post not found.');await db.collection('comments').add({postId:req.params.id,userId:req.user.id,text,createdAt:stamp()});await p.ref.update({commentsCount:FV.increment(1)});await notify(p.data().authorId,req.user.id,'comment',`${req.user.displayName} replied to your post`,req.params.id);res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/posts/:id/bookmark',requireUser,async(req,res)=>{try{const ref=db.collection('bookmarks').doc(`${req.user.id}_${req.params.id}`),s=await ref.get();if(s.exists)await ref.delete();else await ref.set({userId:req.user.id,postId:req.params.id,createdAt:stamp()});res.json({ok:true,bookmarked:!s.exists})}catch(e){res.status(400).json({error:e.message})}});
+app.get('/api/bookmarks',requireUser,async(req,res)=>{try{const s=await db.collection('bookmarks').where('userId','==',req.user.id).limit(80).get();const ids=s.docs.map(d=>d.data().postId);const rows=[];for(const id of ids){const p=await db.collection('posts').doc(id).get();if(p.exists)rows.push({id:p.id,...p.data()})}rows.sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows,req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/search',requireUser,async(req,res)=>{try{const q=clean(req.query.q,60).toLowerCase();if(!q)return res.json({users:[]});const s=await db.collection('users').orderBy('username').startAt(q).endAt(q+'\uf8ff').limit(20).get();res.json({users:s.docs.map(d=>safe({id:d.id,...d.data()}))})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/users/search',requireUser,async(req,res)=>{req.url='/api/search?q='+encodeURIComponent(req.query.q||'');return app._router.handle(req,res,()=>{})});
+app.get('/api/users/:username',requireUser,async(req,res)=>{try{const s=await db.collection('users').doc(username(req.params.username)).get();if(!s.exists)return res.status(404).json({error:'User not found.'});const u={id:s.id,...s.data()},f=await db.collection('follows').doc(`${req.user.id}_${s.id}`).get();res.json({user:safe(u),following:f.exists})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/users/:username/follow',requireUser,async(req,res)=>{try{const target=username(req.params.username);if(target===req.user.id)throw Error('You cannot follow yourself.');const t=await getUser(target);if(!t)throw Error('User not found.');const ref=db.collection('follows').doc(`${req.user.id}_${target}`),s=await ref.get();if(s.exists){await ref.delete();await db.collection('users').doc(req.user.id).update({followingCount:FV.increment(-1)});await db.collection('users').doc(target).update({followersCount:FV.increment(-1)});res.json({ok:true,following:false})}else{await ref.set({followerId:req.user.id,followingId:target,createdAt:stamp()});await db.collection('users').doc(req.user.id).update({followingCount:FV.increment(1)});await db.collection('users').doc(target).update({followersCount:FV.increment(1)});await notify(target,req.user.id,'follow',`${req.user.displayName} started following you`);res.json({ok:true,following:true})}}catch(e){res.status(400).json({error:e.message})}});
+app.get('/api/users/:username/posts',requireUser,async(req,res)=>{try{const s=await db.collection('posts').where('authorId','==',username(req.params.username)).limit(100).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));res.json({posts:await attachUsers(rows,req.user.id)})}catch(e){res.status(500).json({error:e.message})}});
+async function people(usernameVal,type){const s=await db.collection('follows').where(type==='followers'?'followingId':'followerId','==',usernameVal).limit(100).get();const ids=s.docs.map(d=>type==='followers'?d.data().followerId:d.data().followingId);const out=[];for(const id of ids){const u=await getUser(id);if(u)out.push(safe(u))}return out}
+app.get('/api/users/:username/followers',requireUser,async(req,res)=>{try{res.json({users:await people(username(req.params.username),'followers')})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/users/:username/following',requireUser,async(req,res)=>{try{res.json({users:await people(username(req.params.username),'following')})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/suggestions',requireUser,async(req,res)=>{try{const fs=await db.collection('follows').where('followerId','==',req.user.id).get();const excluded=new Set([req.user.id,...fs.docs.map(d=>d.data().followingId)]);const s=await db.collection('users').limit(30).get();res.json({users:s.docs.map(d=>safe({id:d.id,...d.data()})).filter(u=>!excluded.has(u.id)).slice(0,6)})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/trending',requireUser,async(req,res)=>{try{const s=await db.collection('posts').limit(150).get(),counts={};for(const d of s.docs){const text=d.data().text||'';for(const t of text.match(/#[a-z0-9_]+/gi)||[]){const tag=t.toLowerCase();counts[tag]=(counts[tag]||0)+1}}const trends=Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([tag,count])=>({tag,count}));res.json({trends})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/notifications',requireUser,async(req,res)=>{try{const s=await db.collection('notifications').where('userId','==',req.user.id).limit(80).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt?._seconds||0)-(a.createdAt?._seconds||0));const out=[];for(const n of rows){const u=await getUser(n.actorId);out.push({...n,actor:u?safe(u):null})}res.json({notifications:out,count:req.query.unread==='1'?rows.filter(x=>!x.read).length:rows.length})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/notifications/read',requireUser,async(req,res)=>{try{const s=await db.collection('notifications').where('userId','==',req.user.id).where('read','==',false).limit(100).get();await Promise.all(s.docs.map(d=>d.ref.update({read:true})));res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
+function chatId(a,b){return [a,b].sort().join('__')}
+app.get('/api/messages',requireUser,async(req,res)=>{try{const s=await db.collection('conversations').where('participants','array-contains',req.user.id).limit(50).get();const rows=[];for(const d of s.docs){const x=d.data(),other=x.participants.find(p=>p!==req.user.id),u=await getUser(other);if(u)rows.push({id:d.id,lastMessage:x.lastMessage||'',updatedAt:x.updatedAt,user:safe(u)})}rows.sort((a,b)=>(b.updatedAt?._seconds||0)-(a.updatedAt?._seconds||0));res.json({conversations:rows})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/messages/:username',requireUser,async(req,res)=>{try{const u=await getUser(username(req.params.username));if(!u)return res.status(404).json({error:'User not found.'});const cid=chatId(req.user.id,u.id),c=await db.collection('conversations').doc(cid).get();if(!c.exists)return res.json({user:safe(u),messages:[]});const s=await c.ref.collection('messages').limit(100).get();const rows=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(a.createdAt?._seconds||0)-(b.createdAt?._seconds||0));res.json({user:safe(u),messages:rows})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/messages/:username',requireUser,async(req,res)=>{try{const u=await getUser(username(req.params.username));if(!u)return res.status(404).json({error:'User not found.'});const text=clean(req.body.text,2000),imageUrl=clean(req.body.imageUrl,1000);if(!text&&!imageUrl)throw Error('Message is empty.');const cid=chatId(req.user.id,u.id),ref=db.collection('conversations').doc(cid);await ref.set({participants:[req.user.id,u.id],lastMessage:text||'📷 Photo',updatedAt:stamp()},{merge:true});await ref.collection('messages').add({senderId:req.user.id,receiverId:u.id,text,imageUrl,createdAt:stamp()});await notify(u.id,req.user.id,'message',`${req.user.displayName} sent you a message`);res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
+app.get('/api/admin/stats',async(req,res)=>{const adminUser=process.env.ADMIN_USERNAME;if(!adminUser||currentId(req)!==adminUser)return res.status(403).json({error:'Admin access required.'});try{const [u,p,f,n]=await Promise.all([db.collection('users').get(),db.collection('posts').get(),db.collection('follows').get(),db.collection('notifications').get()]);res.json({users:u.size,posts:p.size,follows:f.size,notifications:n.size})}catch(e){res.status(500).json({error:e.message})}});
+app.use(express.static('.'));
+module.exports=app;
