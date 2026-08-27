@@ -1,0 +1,7 @@
+{
+  "name":"bluewave-social",
+  "version":"1.0.0",
+  "private":true,
+  "engines":{"node":">=20"},
+  "dependencies":{"@vercel/node":"latest","express":"^5.1.0","firebase-admin":"^13.4.0"}
+}
