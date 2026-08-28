@@ -45,7 +45,7 @@ function currentSession(req) {
   const token = parseCookies(req.headers.cookie || '')[COOKIE];
   if (!token) return null;
   const [body, sig] = token.split('.');
-  if (!body || !sig || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(sign(body)))) return null;
+  if (!body || !sig) return null; const expected=Buffer.from(sign(body)); const actual=Buffer.from(sig); if (actual.length!==expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
   try { const p = JSON.parse(Buffer.from(body,'base64url').toString()); if (!p.exp || p.exp < Date.now()) return null; return p; } catch { return null; }
 }
 function setSession(res, uid, role='user') {
@@ -101,6 +101,7 @@ app.post('/api/auth/login', async (req,res)=>{
 });
 app.post('/api/auth/logout',(req,res)=>{clearSession(res);return ok(res);});
 app.get('/api/auth/me', async (req,res)=>{try{const s=currentSession(req);if(!s)return ok(res,{user:null});const d=await firestore().collection('users').doc(s.uid).get();if(!d.exists)return ok(res,{user:null});const u=d.data();return ok(res,{user:{...u,passwordHash:undefined,passwordSalt:undefined,uid:d.id}})}catch(e){return fail(res,e.message,500)}});
+app.post('/api/presence', async (req,res)=>{try{const s=await requireUser(req,res);if(!s)return;await firestore().collection('users').doc(s.uid).update({lastSeenAt:Date.now()});return ok(res)}catch(e){return fail(res,e.message,500)}});
 
 async function userDoc(uid){ const d=await firestore().collection('users').doc(uid).get(); return d.exists?{id:d.id,...d.data()}:null; }
 
