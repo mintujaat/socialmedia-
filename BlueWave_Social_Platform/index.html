@@ -1,1 +1,98 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BlueWave — Social</title><meta name="description" content="BlueWave social platform"><link rel="stylesheet" href="/style.css"></head><body><div id="app"><div class="splash"><div class="logo-mark">B</div><h1>BlueWave</h1><p>Share. Discover. Connect.</p></div></div><script src="/app.js?v=email2" defer></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>BlueWave — Connect beyond the timeline</title>
+  <meta name="description" content="BlueWave — share, discover, chat and connect.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <noscript><div class="noscript">BlueWave needs JavaScript enabled.</div></noscript>
+
+  <!-- Static auth screen: never depends on JS to exist. -->
+  <div id="authScreen" class="auth-screen">
+    <div class="auth-glow glow-a"></div><div class="auth-glow glow-b"></div>
+    <div class="auth-shell">
+      <div class="auth-brand-block">
+        <div class="brand-mark">B</div>
+        <div>
+          <div class="brand-name">BlueWave</div>
+          <div class="brand-tag">Share. Discover. Connect.</div>
+        </div>
+      </div>
+      <div class="auth-grid">
+        <div class="auth-copy">
+          <div class="eyebrow">A social space for your people</div>
+          <h1>Post your thought.<br><span>Find your wave.</span></h1>
+          <p>Follow people you care about, share photos, discover conversations and message friends — all in one clean place.</p>
+          <div class="auth-pills"><span>✦ Photos</span><span>✦ Communities</span><span>✦ DMs</span></div>
+        </div>
+        <section class="auth-card" aria-label="Authentication">
+          <div class="auth-tabs">
+            <button class="auth-tab active" data-auth="login">Log in</button>
+            <button class="auth-tab" data-auth="register">Sign up</button>
+          </div>
+          <div id="loginForm" class="auth-form">
+            <h2>Welcome back</h2><p class="auth-sub">Log in with your email.</p>
+            <label>Email<input id="loginEmail" type="email" autocomplete="email" placeholder="you@example.com"></label>
+            <label>Password<input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••"></label>
+            <button class="primary-btn wide" id="loginBtn">Log in</button>
+            <div id="loginMsg" class="form-msg"></div>
+          </div>
+          <div id="registerForm" class="auth-form hidden">
+            <h2>Create your account</h2><p class="auth-sub">Your email is used for secure sign-in.</p>
+            <label>Email<input id="regEmail" type="email" autocomplete="email" placeholder="you@example.com"></label>
+            <label>Username<input id="regUsername" type="text" autocomplete="username" placeholder="mintu_jaat"></label>
+            <div class="two-col">
+              <label>Display name<input id="regName" type="text" placeholder="Your name"></label>
+              <label>Password<input id="regPassword" type="password" autocomplete="new-password" placeholder="6+ characters"></label>
+            </div>
+            <button class="primary-btn wide" id="registerBtn">Create account</button>
+            <div id="registerMsg" class="form-msg"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div id="appScreen" class="app-screen hidden">
+    <header class="topbar">
+      <a class="brand" href="#home"><span class="brand-mark small">B</span>BlueWave</a>
+      <div class="search-wrap"><span>⌕</span><input id="globalSearch" placeholder="Search people, usernames…" autocomplete="off"><div id="searchDrop" class="search-drop hidden"></div></div>
+      <div class="top-actions"><button class="ghost-btn" id="notifTop" title="Notifications">♡<span id="notifBadge" class="badge hidden">0</span></button><button class="avatar-btn" id="meAvatarBtn"><img id="meAvatar" src="/avatar.svg" alt=""></button></div>
+    </header>
+    <div class="page-shell">
+      <aside class="left-rail">
+        <div class="profile-mini card"><img id="railAvatar" class="avatar xl" src="/avatar.svg" alt=""><div class="mini-name" id="railName">You</div><div class="muted" id="railUsername">@username</div></div>
+        <nav class="main-nav">
+          <a href="#home" data-nav="home"><span>⌂</span> Home</a>
+          <a href="#explore" data-nav="explore"><span>◈</span> Explore</a>
+          <a href="#notifications" data-nav="notifications"><span>♡</span> Notifications</a>
+          <a href="#chats" data-nav="chats"><span>✉</span> Messages</a>
+          <a href="#profile" data-nav="profile"><span>◉</span> Profile</a>
+          <a href="#settings" data-nav="settings"><span>⚙</span> Settings</a>
+        </nav>
+        <button class="primary-btn wide post-rail" id="railPost">Post</button>
+        <button class="text-btn logout-link" id="logoutBtn">Log out</button>
+      </aside>
+
+      <main class="main-column"><div id="view"></div></main>
+
+      <aside class="right-rail">
+        <div class="card panel"><div class="panel-head"><h3>Who to follow</h3><a href="#explore">See all</a></div><div id="suggestions"></div></div>
+        <div class="card panel"><div class="panel-head"><h3>Trending</h3><a href="#explore">Explore</a></div><div id="trending"></div></div>
+        <div class="tiny-footer">BlueWave · Community · Privacy · Terms</div>
+      </aside>
+    </div>
+    <nav class="bottom-nav"><a href="#home">⌂<span>Home</span></a><a href="#explore">◈<span>Explore</span></a><a href="#chats">✉<span>Chat</span></a><a href="#notifications">♡<span>Alerts</span></a><a href="#profile">◉<span>Profile</span></a></nav>
+  </div>
+
+  <div id="toastRoot" class="toast-root"></div>
+  <div id="modalRoot"></div>
+  <script src="/app.js?v=final1" defer></script>
+</body>
+</html>

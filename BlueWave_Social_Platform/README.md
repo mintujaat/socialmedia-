@@ -1,32 +1,16 @@
 # BlueWave Social Platform
 
-HTML/CSS/JS-first social platform for Vercel + Firebase Firestore + ImgBB.
-
-## Features
-- Email + username + password registration/login
-- Home feed and Explore
-- Posts with text/photos
-- Likes, comments, bookmarks, shares
-- Follow / unfollow, followers / following
-- User search and suggestions
-- Profiles and profile editing
-- Private 1-to-1 chat and chat images
-- Notifications
-- Admin dashboard for users and post moderation
-- ImgBB for profile/cover/post/chat images; Firebase Storage is not required
+HTML-first social platform for Vercel + Firebase Firestore + ImgBB.
 
 ## Vercel
-Set Root Directory to the folder containing `index.html` and `api/`.
-No build command is required.
+Root directory should be the folder containing `index.html`, `api/`, `package.json`, and `vercel.json`.
 
-### Environment variables
+Environment variables:
 - FIREBASE_SERVICE_ACCOUNT_JSON
+- FIREBASE_DATABASE_URL (optional for current Firestore-first app)
 - IMGBB_API_KEY
 - SESSION_SECRET
 - ADMIN_USERNAME
 - ADMIN_PASSWORD
 
-Optional legacy Firebase variables are supported by the API fallback, but the recommended setup is `FIREBASE_SERVICE_ACCOUNT_JSON`.
-
-## Firebase
-Enable Firestore. Deploy the included `firestore.rules` if Firestore is used only through the backend Admin SDK.
+Images are uploaded through `/api/upload` and only the returned ImgBB URL is stored in Firestore.
